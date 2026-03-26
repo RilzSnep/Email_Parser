@@ -9,7 +9,6 @@ import warnings
 from datetime import datetime, timedelta
 from clickhouse_driver import Client
 
-# 🛠 ИСПРАВЛЕНИЕ: Отключаем ВСЕ предупреждения (включая RequestsDependencyWarning)
 warnings.filterwarnings("ignore")
 
 # ================= НАСТРОЙКИ =================
@@ -31,10 +30,10 @@ TABLE_NAME = 'vtochku_between'
 TELEGRAM_TOKEN = "8780548561:AAFAZFWuy4RIjN1oNTfND6imRcFmbXoYSdI"
 CHAT_ID = 5106855055
 
-# ⏰ ВРЕМЯ ЗАПУСКА (для теста поставьте текущее время + 1 минута)
-START_HOUR = 15
-START_MINUTE = 40
-CHECK_INTERVAL = 60  # Для теста уменьшил до 1 минуты, чтобы быстрее видеть результат. Потом верните 300.
+START_HOUR = 11
+START_MINUTE = 57
+CHECK_INTERVAL = 300  # 5 минут
+SCAN_LAST_COUNT = 10  # Чуть больше запас
 
 
 # ===============================================
@@ -45,61 +44,73 @@ def decode_mime_words(s):
     return ''.join(word.decode(encoding or 'utf8') if isinstance(word, bytes) else word for word, encoding in decoded)
 
 
-def send_telegram_message(text):
+def send_telegram_message(text, is_alert=False):
+    # Исправлено: убраны пробелы (на всякий случай)
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+    if is_alert:
+        payload['text'] = f"🚨 <b>ALERT:</b>\n{text}"
+
     try:
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, timeout=10)
         if response.status_code == 200:
-            print("   📩 Уведомление отправлено в Telegram")
+            print("   📩 TG: Отправлено")
         else:
-            print(f"   ⚠️ Ошибка TG: {response.text}")
+            print(f"   ⚠️ TG Error: {response.text}")
     except Exception as e:
-        print(f"   ❌ Ошибка отправки в TG: {e}")
+        print(f"   ❌ TG Exception: {e}")
 
 
 def check_db_for_date(target_date):
-    """Проверяет наличие данных за дату в ClickHouse"""
     client = None
     try:
         client = Client(**CH_CONFIG)
-        # Используем f-string для безопасной подстановки даты
         query = f"SELECT count() FROM {TABLE_NAME} WHERE event_date = '{target_date}'"
         result = client.execute(query)
-        count = result[0][0] if result else 0
-        return count > 0
+        return (result[0][0] > 0) if result else False
     except Exception as e:
-        print(f"   ❌ Ошибка проверки БД: {e}")
+        print(f"   ❌ DB Check Error: {e}")
         return False
     finally:
         if client: client.disconnect()
 
 
 def prepare_data_for_ch(df):
+    # 1. Проверка обязательных колонок
+    required = ['date', 'hour']
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"В файле отсутствуют колонки: {missing}")
+
     df['event_date'] = pd.to_datetime(df['date']).dt.date
     df['event_hour'] = pd.to_datetime(df['hour']).dt.hour
 
     numeric_cols = ['publisher_id', 'section_id', 'bid_responses', 'responses',
                     'impressions', 'v_firstq', 'v_midpoint', 'v_thirdq', 'v_complete']
     for col in numeric_cols:
-        if col in df.columns: df[col] = df[col].fillna(0).astype(int)
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
 
     decimal_cols = ['net_payable', 'actual_pub']
     for col in decimal_cols:
-        if col in df.columns: df[col] = df[col].fillna(0.0).astype(float)
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0).astype(float)
 
     columns_map = {
-        'event_date': 'event_date', 'event_hour': 'event_hour',
-        'publisher_id': 'publisher_id', 'section_name': 'section_name',
-        'section_id': 'section_id', 'cp_bidder_name': 'cp_bidder_name',
-        'bid_responses': 'bid_responses', 'responses': 'responses',
-        'impressions': 'impressions', 'net_payable': 'net_payable',
-        'actual_pub': 'actual_pub', 'v_firstq': 'v_firstq',
-        'v_midpoint': 'v_midpoint', 'v_thirdq': 'v_thirdq',
-        'v_complete': 'v_complete'
+        'event_date': 'event_date', 'event_hour': 'event_hour', 'publisher_id': 'publisher_id',
+        'section_name': 'section_name', 'section_id': 'section_id', 'cp_bidder_name': 'cp_bidder_name',
+        'bid_responses': 'bid_responses', 'responses': 'responses', 'impressions': 'impressions',
+        'net_payable': 'net_payable', 'actual_pub': 'actual_pub', 'v_firstq': 'v_firstq',
+        'v_midpoint': 'v_midpoint', 'v_thirdq': 'v_thirdq', 'v_complete': 'v_complete'
     }
 
-    final_df = df[list(columns_map.keys())].rename(columns=columns_map)
+    available_cols = [k for k in columns_map.keys() if k in df.columns]
+    final_df = df[available_cols].rename(columns={k: columns_map[k] for k in available_cols})
+
+    # 2. Проверка, что ключевые данные не пусты
+    if 'impressions' not in final_df.columns or 'event_date' not in final_df.columns:
+        raise ValueError("После маппинга отсутствуют ключевые колонки (impressions/event_date)")
+
     final_df['inserted_at'] = datetime.now()
     return final_df
 
@@ -111,143 +122,130 @@ def insert_to_clickhouse(df):
         data = df.to_dict('records')
         if not data: return 0, 0, 0, None
 
-        query = f"""
-            INSERT INTO {TABLE_NAME} 
-            (event_date, event_hour, publisher_id, section_name, section_id, 
-             cp_bidder_name, bid_responses, responses, impressions, net_payable, 
-             actual_pub, v_firstq, v_midpoint, v_thirdq, v_complete, inserted_at)
-            VALUES
-        """
+        cols = list(df.columns)
+        query = f"INSERT INTO {TABLE_NAME} ({', '.join(cols)}) VALUES"
         client.execute(query, data)
 
-        total_imp = df['impressions'].sum()
-        total_rev = df['net_payable'].sum()
-        report_date = df['event_date'].iloc[0]
-
-        return len(data), total_imp, total_rev, report_date
+        return len(data), int(df['impressions'].sum()), float(df['net_payable'].sum()), df['event_date'].iloc[0]
     except Exception as e:
-        print(f"   ❌ Ошибка БД: {e}")
-        return 0, 0, 0, None
+        print(f"   ❌ DB Insert Error: {e}")
+        raise e  # Пробрасываем ошибку выше, чтобы не пометить письмо как прочитанное
     finally:
         if client: client.disconnect()
 
 
 def check_and_load():
     timestamp = datetime.now().strftime('%H:%M:%S')
-    print(f"[{timestamp}] 🔍 Проверка статуса...")
-
-    # Целевая дата - вчера
-    target_date = (datetime.now() - timedelta(days=1)).date()
-    print(f"   📅 Проверяем наличие отчета за: {target_date}")
-
-    # 1. Проверка БД
-    if check_db_for_date(target_date):
-        print(f"   ✅ Отчет за {target_date} УЖЕ есть в базе!")
-        print("   🧹 Очищаем почту (помечаем все письма с темой как прочитанные)...")
-        mail = None
-        try:
-            mail = imaplib.IMAP4_SSL(IMAP_SERVER)
-            mail.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
-            mail.select("inbox")
-            status, messages = mail.search(None, f'(SUBJECT "{SUBJECT_KEYWORD}")')
-            if status == "OK":
-                for email_id in messages[0].split():
-                    mail.store(email_id, '+FLAGS', '\\Seen')
-            print("   ✅ Почта очищена.")
-        except:
-            pass
-        finally:
-            if mail:
-                try:
-                    mail.close(); mail.logout()
-                except:
-                    pass
-        return True
-
-        # 2. Поиск на почте
-    print(f"   ⏳ Отчета за {target_date} нет. Ищем на почте...")
+    print(f"[{timestamp}] 🔍 Запуск проверки почты...")
 
     mail = None
+    loaded_count = 0
+    error_occurred = False
+
     try:
         mail = imaplib.IMAP4_SSL(IMAP_SERVER)
         mail.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
         mail.select("inbox")
 
-        search_criteria = f'(UNSEEN SUBJECT "{SUBJECT_KEYWORD}")'
-        status, messages = mail.search(None, search_criteria)
+        status, messages = mail.search(None, f'(SUBJECT "{SUBJECT_KEYWORD}")')
+        if status != "OK":
+            raise Exception(f"IMAP Search Error: {status}")
 
-        if status != "OK": return False
-
-        email_ids = messages[0].split()
-        if not email_ids:
-            print(f"   ℹ️ Новых непрочитанных писем не найдено.")
+        all_email_ids = messages[0].split()
+        if not all_email_ids:
+            print("   ℹ️ Письма не найдены.")
             return False
 
-        print(f"   📬 Найдено кандидатов: {len(email_ids)}")
+        recent_ids = all_email_ids[-SCAN_LAST_COUNT:]
+        recent_ids.reverse()
+        print(f"   📬 Найдено: {len(all_email_ids)}. Проверяем последние {len(recent_ids)}...")
 
-        for email_id in email_ids:
-            status, msg_data = mail.fetch(email_id, "(RFC822)")
-            if status != "OK": continue
-
+        for email_id in recent_ids:
+            _, msg_data = mail.fetch(email_id, "(RFC822)")
             msg = email.message_from_bytes(msg_data[0][1])
             subject = decode_mime_words(msg.get("Subject", ""))
 
-            for part in msg.walk():
-                content_disposition = str(part.get("Content-Disposition"))
-                if "attachment" in content_disposition:
-                    filename = part.get_filename()
-                    filename = decode_mime_words(filename)
+            if SUBJECT_KEYWORD not in subject: continue
 
+            print(f"\n   📨 Обработка: {subject}")
+            file_found = False
+            load_success = False
+
+            for part in msg.walk():
+                if "attachment" in str(part.get("Content-Disposition")):
+                    filename = decode_mime_words(part.get_filename())
                     if filename and filename.lower().endswith('.csv'):
-                        file_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        safe_name = f"{file_ts}_{filename}"
-                        filepath = os.path.join(SAVE_FOLDER, safe_name)
+                        file_found = True
+                        print(f"      📎 Файл: {filename}")
+
+                        file_data = part.get_payload(decode=True)
+                        filepath = os.path.join(SAVE_FOLDER, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{filename}")
 
                         with open(filepath, "wb") as f:
-                            f.write(part.get_payload(decode=True))
-                        print(f"   💾 Скачан: {safe_name}")
+                            f.write(file_data)
 
                         try:
-                            df = pd.read_csv(filepath)
+                            # Попытка чтения с авто-определением кодировки
+                            try:
+                                df = pd.read_csv(filepath)
+                            except UnicodeDecodeError:
+                                print("      ⚠️ UTF-8 не подошел, пробуем CP1251...")
+                                df = pd.read_csv(filepath, encoding='cp1251')
+
                             if df.empty:
-                                print("   ⚠️ Файл пуст.")
-                                continue
+                                raise ValueError("Файл пуст")
 
-                            first_date_in_file = pd.to_datetime(df['date'].iloc[0]).date()
+                            report_date = pd.to_datetime(df['date'].iloc[0]).date()
+                            print(f"      📅 Дата: {report_date}")
 
-                            if first_date_in_file != target_date:
-                                print(f"   ⚠️ Файл за дату {first_date_in_file}, а ждем {target_date}. Пропускаем.")
-                                continue
-
-                            df_prepared = prepare_data_for_ch(df)
-                            rows_loaded, imp, rev, rep_date = insert_to_clickhouse(df_prepared)
-
-                            if rows_loaded > 0:
-                                print(f"   ✅ УСПЕХ! Загружено {rows_loaded} строк.")
-
-                                msg_text = (
-                                    f"📊 <b>Отчет выгружен!</b>\n\n"
-                                    f"📅 Дата отчета: <b>{rep_date}</b>\n"
-                                    f"📈 Impressions: <b>{imp:,}</b>\n"
-                                    f"💰 Revenue: <b>{rev:,.2f} $</b>\n\n"
-                                    f"✅ Данные добавлены в ClickHouse."
-                                )
-                                send_telegram_message(msg_text)
-
-                                mail.store(email_id, '+FLAGS', '\\Seen')
-                                return True
+                            if check_db_for_date(report_date):
+                                print(f"      ✅ Уже в БД")
+                                load_success = True  # Считаем успешным, что обработали (данные есть)
                             else:
-                                print(f"   ⚠️ Файл прочитан, но данных для загрузки нет.")
+                                df_prepared = prepare_data_for_ch(df)
+                                rows, imp, rev, date = insert_to_clickhouse(df_prepared)
+
+                                if rows > 0:
+                                    print(f"      🚀 Загружено {rows} строк!")
+                                    loaded_count += 1
+                                    load_success = True
+
+                                    msg_text = (
+                                        f"📊 <b>Отчет выгружен!</b>\n\n"
+                                        f"📅 Дата: <b>{date}</b>\n"
+                                        f"📈 Impressions: <b>{imp:,}</b>\n"
+                                        f"💰 Revenue: <b>{rev:,.2f} $</b>"
+                                    )
+                                    send_telegram_message(msg_text)
+                                else:
+                                    raise ValueError("Загрузка вернула 0 строк")
+
                         except Exception as e:
-                            print(f"   ❌ Ошибка обработки файла: {e}")
+                            print(f"      ❌ Ошибка обработки: {e}")
+                            error_occurred = True
+                            # Не помечаем как seen, чтобы повторить при следующем запуске!
+                            # Но чтобы не зациклиться на битом файле вечно, можно добавить счетчик попыток (в прод. версии)
+                            send_telegram_message(f"❌ Ошибка обработки файла {filename}:\n{str(e)}", is_alert=True)
+                        break
 
-            # Помечаем письмо как прочитанное в любом случае, чтобы не зациклиться
-            mail.store(email_id, '+FLAGS', '\\Seen')
+            # Помечаем как прочитанное ТОЛЬКО если файл найден и обработка успешна (или данные уже есть)
+            if file_found and (load_success or not error_occurred):
+                # Логика: если была ошибка (error_occurred=True), мы НЕ помечаем, чтобы попробовать снова.
+                # НО: если ошибка критическая (файл битый навсегда), мы зациклимся.
+                # Компромисс: помечаем, если данные уже есть ИЛИ загрузка прошла успешно.
+                if load_success:
+                    mail.store(email_id, '+FLAGS', '\\Seen')
+            elif not file_found:
+                # Если письма без вложения - помечаем, чтобы не спамить
+                mail.store(email_id, '+FLAGS', '\\Seen')
 
-        return False
+        print(f"\n--- Итог: загружено {loaded_count} ---")
+        return loaded_count > 0
 
     except Exception as e:
-        print(f"   ❌ Ошибка соединения: {e}")
+        err_msg = f"Критическая ошибка скрипта: {e}"
+        print(f"   ❌ {err_msg}")
+        send_telegram_message(err_msg, is_alert=True)
         return False
     finally:
         if mail:
@@ -260,58 +258,47 @@ def check_and_load():
 def wait_until_start_time():
     now = datetime.now()
     target = now.replace(hour=START_HOUR, minute=START_MINUTE, second=0, microsecond=0)
-
     if now >= target:
         target += timedelta(days=1)
 
     sleep_time = (target - now).total_seconds()
-    print(f"⏳ Следующий старт в {target.strftime('%H:%M')} (через {sleep_time / 60:.1f} мин.)")
-    print("💤 Скрипт спит...")
+
+    # Предохранитель от сбоя часов
+    if sleep_time < 0 or sleep_time > 90000:
+        print("⚠️ Сбой времени! Ограничиваю сон 24 часами.")
+        sleep_time = 86400
+
+    print(f"⏳ Сон до {target.strftime('%H:%M')} ({sleep_time / 60:.1f} мин.)")
     time.sleep(sleep_time)
 
 
 def main():
-    if not os.path.exists(SAVE_FOLDER):
-        os.makedirs(SAVE_FOLDER)
+    if not os.path.exists(SAVE_FOLDER): os.makedirs(SAVE_FOLDER)
 
     print("=" * 60)
-    print("🤖 Умный загрузчик + Telegram (Исправленный v2)")
-    print(f"🕒 Старт: ежедневно в {START_HOUR:02d}:{START_MINUTE:02d}")
-    print(f"🔍 Логика: Проверка БД -> Почта -> TG")
+    print("🤖 Умный загрузчик v5 (Production)")
+    print(f"🕒 Старт: {START_HOUR:02d}:{START_MINUTE:02d}")
     print("=" * 60)
 
     while True:
-        wait_until_start_time()
-
-        print("\n" + "=" * 60)
-        print(f"☀️ Проснулся! Начинаю работу ({datetime.now().strftime('%H:%M')})")
-        print("=" * 60)
-
-        success = False
-        attempts = 0
-        max_attempts = 288
-
-        while not success and attempts < max_attempts:
-            attempts += 1
-            print(f"\n--- Попытка №{attempts} ---")
-
+        try:
+            wait_until_start_time()
+            print(f"\n☀️ Проснулся! {datetime.now().strftime('%H:%M')}")
             success = check_and_load()
 
             if success:
-                print("\n" + "=" * 60)
-                print("🎉 ЗАДАЧА ВЫПОЛНЕНА! Жду следующего дня.")
-                print("=" * 60)
-                break
+                print("\n🎉 Готово! Жду следующего дня.")
             else:
-                print(f"💤 Пока без успеха. Следующая попытка через {CHECK_INTERVAL // 60} мин...")
-                time.sleep(CHECK_INTERVAL)
+                print("\nℹ️ Новых данных нет или были ошибки.")
 
-        if not success:
-            print("\n⚠️ Не удалось выгрузить отчет в течение суток.")
+            print("💤 До завтра...")
+        except KeyboardInterrupt:
+            print("\n⏹ Остановка пользователем.")
+            break
+        except Exception as e:
+            print(f"💥 Unexpected Error in Main Loop: {e}")
+            time.sleep(60)  # Пауза перед перезапуском
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n⏹ Остановка пользователем.")
+    main()
