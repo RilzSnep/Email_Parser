@@ -1,7 +1,6 @@
 import imaplib
 import email
 from email.header import decode_header
-import os
 import time
 import pandas as pd
 import requests
@@ -9,11 +8,19 @@ import warnings
 import asyncio
 import threading
 import io
+import logging
 from datetime import datetime, timedelta
 from clickhouse_driver import Client
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+
+# Настраиваем логирование: скрываем шум от бота при обрыве сети
+logging.basicConfig(level=logging.ERROR)
+logger_aiogram = logging.getLogger("aiogram")
+logger_aiogram.setLevel(logging.CRITICAL)
+logger_aiohttp = logging.getLogger("aiohttp")
+logger_aiohttp.setLevel(logging.CRITICAL)
 
 warnings.filterwarnings("ignore")
 
@@ -36,22 +43,29 @@ TABLE_NAME = 'vtochku_between'
 TELEGRAM_TOKEN = "8780548561:AAFAZFWuy4RIjN1oNTfND6imRcFmbXoYSdI"
 CHAT_ID = 5106855055
 
-START_HOUR = 14
-START_MINUTE = 18
-CHECK_INTERVAL = 30  # 5 минут (интервал повторных попыток)
-SCAN_LAST_COUNT = 10
+START_HOUR = 7
+START_MINUTE = 0
+CHECK_INTERVAL = 300  # 5 минут
+SCAN_LAST_COUNT = 5
 # ===============================================
 
 bot_instance = None
 
 
-def decode_mime_words(s):
+def decode_mime_words(s: str) -> str:
     if not s: return ""
     decoded = decode_header(s)
     return ''.join(word.decode(encoding or 'utf8') if isinstance(word, bytes) else word for word, encoding in decoded)
 
 
-def send_telegram_message(text, is_alert=False, reply_markup_json=None):
+def format_number(num: float | int) -> str:
+    try:
+        return f"{int(num):,}".replace(",", " ")
+    except (ValueError, TypeError):
+        return str(num)
+
+
+def send_telegram_message(text: str, is_alert: bool = False) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
@@ -60,44 +74,41 @@ def send_telegram_message(text, is_alert=False, reply_markup_json=None):
     }
     if is_alert:
         payload['text'] = f"🚨 <b>ALERT:</b>\n{text}"
-    if reply_markup_json:
-        payload['reply_markup'] = reply_markup_json
-
     try:
         response = requests.post(url, json=payload, timeout=10)
         return response.status_code == 200
     except Exception as e:
-        print(f"   ❌ TG Error: {e}")
         return False
 
 
 # --- Логика Бота ---
 
 async def cmd_start(message: types.Message):
-    kb = [
-        [KeyboardButton(text="🔄 Перепроверить почту")]
-    ]
+    kb = [[KeyboardButton(text="🔄 Перепроверить почту")]]
     keyboard = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
     await message.answer(
-        "👋 Привет! Я бот-загрузчик (v7.1).\n\n"
-        "🕒 Стартую в 11:00 и проверяю почту каждые 5 мин, пока не найду новый отчет.\n"
-        "Нажми кнопку ниже для внеплановой проверки!",
+        "👋 Привет! Я бот-загрузчик.\nСкрипт работает в фоновом режиме.\nЖми кнопку для проверки!",
         reply_markup=keyboard
     )
 
 
 async def check_manual(message: types.Message):
-    await message.answer("⏳ Запускаю внеплановую проверку...")
-    loop = asyncio.get_event_loop()
+    await message.answer("⏳ Запускаю проверку почты...")
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     success = await loop.run_in_executor(None, run_single_check)
 
     if success:
-        await message.answer("✅ Успех! Новые данные загружены.")
+        await message.answer("✅ Проверка завершена! Новые данные загружены.")
     else:
-        await message.answer("ℹ️ Новых писем пока нет. Жду следующих проверок.")
+        await message.answer("ℹ️ Новых писем не найдено или отчет уже есть в базе.")
 
 
-async def main_bot():
+async def bot_polling_loop():
     global bot_instance
     bot_instance = Bot(token=TELEGRAM_TOKEN)
     dp = Dispatcher()
@@ -105,13 +116,27 @@ async def main_bot():
     dp.message.register(cmd_start, Command("start"))
     dp.message.register(check_manual, lambda msg: msg.text == "🔄 Перепроверить почту")
 
-    print("🤖 Бот запущен и ждет команд...")
-    await dp.start_polling(bot_instance)
+    print("🤖 Бот запущен и ждет команд (24/7)...")
+    try:
+        await dp.start_polling(bot_instance, allowed_updates=dp.resolve_used_update_types())
+    except Exception as e:
+        print(f"⚠️ Бот остановлен: {e}")
+    finally:
+        await bot_instance.session.close()
+
+
+def run_bot_thread():
+    while True:
+        try:
+            asyncio.run(bot_polling_loop())
+        except Exception as e:
+            print(f"⚠️ Ошибка бота, перезапуск через 10 сек... ({e})")
+            time.sleep(10)
 
 
 # --- Основная логика проверки ---
 
-def run_single_check():
+def run_single_check() -> bool:
     timestamp = datetime.now().strftime('%H:%M:%S')
     print(f"[{timestamp}] 🔍 Запуск проверки почты...")
 
@@ -124,15 +149,13 @@ def run_single_check():
             mail = imaplib.IMAP4_SSL(IMAP_SERVER)
             mail.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
             mail.select("inbox")
-
-            time.sleep(2)  # Пауза от лимитов
+            time.sleep(2)
 
             search_query = f'(SUBJECT "{SUBJECT_KEYWORD}")'
             status, messages = mail.search(None, search_query)
 
             if status != "OK":
                 if retry_count == 0:
-                    print(f"   ⚠️ Ошибка поиска ({status}). Переподключение...")
                     retry_count += 1
                     if mail:
                         try:
@@ -143,7 +166,11 @@ def run_single_check():
                 else:
                     raise Exception(f"IMAP Search Error: {status}")
 
-            all_email_ids = messages[0].split()
+            if not messages or not messages[0]:
+                all_email_ids = []
+            else:
+                all_email_ids = messages[0].split()
+
             if not all_email_ids:
                 print("   ℹ️ Письма не найдены.")
                 return False
@@ -157,8 +184,7 @@ def run_single_check():
                 msg = email.message_from_bytes(msg_data[0][1])
                 subject = decode_mime_words(msg.get("Subject", ""))
 
-                if SUBJECT_KEYWORD not in subject:
-                    continue
+                if SUBJECT_KEYWORD not in subject: continue
 
                 print(f"\n   📨 Обработка: {subject}")
                 file_found = False
@@ -176,16 +202,26 @@ def run_single_check():
 
                             try:
                                 try:
-                                    df = pd.read_csv(csv_buffer)
+                                    df = pd.read_csv(csv_buffer, encoding='utf-8')
                                 except UnicodeDecodeError:
                                     csv_buffer.seek(0)
-                                    print("      ⚠️ UTF-8 не подошел, пробуем CP1251...")
                                     df = pd.read_csv(csv_buffer, encoding='cp1251')
 
-                                if df.empty: raise ValueError("Файл пуст")
+                                if df.empty:
+                                    raise ValueError("Файл пуст (нет строк данных)")
+
+                                # Проверяем наличие обязательных колонок ДО передачи в функцию
+                                required_cols = ['date', 'hour']
+                                missing_cols = [col for col in required_cols if col not in df.columns]
+
+                                if missing_cols:
+                                    # Формируем красивое сообщение об ошибке
+                                    cols_str = ", ".join([f"'{c}'" for c in missing_cols])
+                                    raise ValueError(
+                                        f"❌ Нарушена структура файла! Отсутствуют обязательные столбцы: {cols_str}.")
 
                                 report_date = pd.to_datetime(df['date'].iloc[0]).date()
-                                print(f"      📅 Дата: {report_date}")
+                                print(f"      📅 Дата отчета: {report_date}")
 
                                 if check_db_for_date(report_date):
                                     print(f"      ✅ Уже в БД")
@@ -198,23 +234,41 @@ def run_single_check():
                                         print(f"      🚀 Загружено {rows} строк!")
                                         loaded_count += 1
                                         load_success = True
-
                                         msg_text = (
                                             f"📊 <b>Отчет выгружен!</b>\n\n"
                                             f"📅 Дата: <b>{date}</b>\n"
-                                            f"📈 Impressions: <b>{imp:,}</b>\n"
-                                            f"💰 Revenue: <b>{rev:,.2f} $</b>"
+                                            f"📈 Impressions: <b>{format_number(int(imp))}</b>\n"
+                                            f"💰 Revenue: <b>${rev:,.2f}</b>"
                                         )
                                         send_telegram_message(msg_text)
                                     else:
                                         raise ValueError("Загрузка вернула 0 строк")
 
-                            except Exception as e:
-                                print(f"      ❌ Ошибка обработки: {e}")
-                                send_telegram_message(f"❌ Ошибка файла {filename}:\n{str(e)}", is_alert=True)
-                            break
+                            except ValueError as ve:
+                                # Ловим ошибки структуры и данных отдельно для красивого алерта
+                                err_text = str(ve)
+                                print(f"      ❌ Ошибка данных: {err_text}")
 
-                # Помечаем как прочитанное, если файл найден и обработан (или уже был в БД)
+                                alert_msg = (
+                                    f"📁 Файл: <b>{filename}</b>\n"
+                                    f"📩 Тема: {subject}\n\n"
+                                    f"⚠️ <b>Ошибка структуры или данных:</b>\n{err_text}"
+                                )
+                                send_telegram_message(alert_msg, is_alert=True)
+
+                            except Exception as e:
+                                # Ловим остальные непредвиденные ошибки
+                                err_text = str(e)
+                                print(f"      ❌ Критическая ошибка: {err_text}")
+                                alert_msg = (
+                                    f"📁 Файл: <b>{filename}</b>\n"
+                                    f"📩 Тема: {subject}\n\n"
+                                    f"🚨 <b>Критическая ошибка обработки:</b>\n{err_text}"
+                                )
+                                send_telegram_message(alert_msg, is_alert=True)
+
+                            break  # Выход из цикла part после обработки файла
+
                 if file_found and load_success:
                     mail.store(email_id, '+FLAGS', '\\Seen')
                 elif not file_found:
@@ -224,7 +278,7 @@ def run_single_check():
             return loaded_count > 0
 
         except Exception as e:
-            err_msg = f"Критическая ошибка: {e}"
+            err_msg = f"Критическая ошибка цикла: {e}"
             print(f"   ❌ {err_msg}")
             if retry_count >= 2:
                 send_telegram_message(err_msg, is_alert=True)
@@ -235,7 +289,6 @@ def run_single_check():
                     mail.close(); mail.logout()
                 except:
                     pass
-
     return False
 
 
@@ -249,16 +302,17 @@ def check_db_for_date(target_date):
         result = client.execute(query)
         return (result[0][0] > 0) if result else False
     except Exception as e:
-        print(f"   ❌ DB Check Error: {e}")
         return False
     finally:
         if client: client.disconnect()
 
 
 def prepare_data_for_ch(df):
+    # Здесь проверка уже пройдена в основном цикле, но оставим для надежности
     required = ['date', 'hour']
     missing = [c for c in required if c not in df.columns]
-    if missing: raise ValueError(f"Нет колонок: {missing}")
+    if missing:
+        raise ValueError(f"Отсутствуют колонки: {missing}")
 
     df['event_date'] = pd.to_datetime(df['date']).dt.date
     df['event_hour'] = pd.to_datetime(df['hour']).dt.hour
@@ -305,7 +359,6 @@ def insert_to_clickhouse(df):
 
         return len(data), int(df['impressions'].sum()), float(df['net_payable'].sum()), df['event_date'].iloc[0]
     except Exception as e:
-        print(f"   ❌ DB Insert Error: {e}")
         raise e
     finally:
         if client: client.disconnect()
@@ -314,70 +367,52 @@ def insert_to_clickhouse(df):
 def wait_until_start_time():
     now = datetime.now()
     target = now.replace(hour=START_HOUR, minute=START_MINUTE, second=0, microsecond=0)
-    if now >= target:
-        target += timedelta(days=1)
-
+    if now >= target: target += timedelta(days=1)
     sleep_time = (target - now).total_seconds()
-    if sleep_time < 0 or sleep_time > 90000:
-        print("⚠️ Сбой времени! Сон 24ч.")
-        sleep_time = 86400
-
+    if sleep_time < 0 or sleep_time > 90000: sleep_time = 86400
     print(f"⏳ Сон до {target.strftime('%H:%M')} ({sleep_time / 60:.1f} мин.)")
     time.sleep(sleep_time)
 
 
 # --- Запуск ---
 
-def run_bot_thread():
-    asyncio.run(main_bot())
-
-
 def main():
     print("=" * 60)
-    print("🤖 Умный загрузчик v7.1 (Loop Until Success)")
-    print(f"🕒 Старт: {START_HOUR:02d}:{START_MINUTE:02d}")
-    print(f"🔁 Интервал повтора: {CHECK_INTERVAL // 60} мин (пока не найдет отчет)")
-    print("💬 Бот готов (/start)")
+    print("🤖 Умный загрузчик v9.4 (Smart Error Reporting)")
+    print(f"🕒 Авто-старт: {START_HOUR:02d}:{START_MINUTE:02d}")
+    print("💡 Бот работает 24/7")
     print("=" * 60)
 
-    bot_thread = threading.Thread(target=run_bot_thread, daemon=True)
-    bot_thread.start()
+    bot_t = threading.Thread(target=run_bot_thread, daemon=True)
+    bot_t.start()
     time.sleep(2)
 
     while True:
         try:
-            # 1. Ждем времени старта
             wait_until_start_time()
 
-            print(f"\n☀️ Проснулся! Начинаю мониторинг ({datetime.now().strftime('%H:%M')})")
+            print(f"\n☀️ Проснулся по расписанию! ({datetime.now().strftime('%H:%M')})")
 
             success = False
             attempts = 0
 
-            # 2. ЦИКЛ ПРОВЕРОК: Крутимся, пока не загрузим новый отчет
             while not success:
                 attempts += 1
                 print(f"\n--- Попытка №{attempts} ---")
-
                 success = run_single_check()
 
                 if success:
-                    print("\n" + "=" * 60)
-                    print("🎉 ОТЧЕТ ЗАГРУЖЕН! Ухожу спать до завтра.")
-                    print("=" * 60)
-                    # Выход из внутреннего цикла, переходим к ожиданию следующего дня
+                    print("\n🎉 ОТЧЕТ ЗАГРУЖЕН! Жду следующего дня.")
                     break
                 else:
                     print(f"\n💤 Отчет еще не пришел. Следующая проверка через {CHECK_INTERVAL // 60} мин...")
                     time.sleep(CHECK_INTERVAL)
 
-            # Здесь цикл продолжается снаружи (wait_until_start_time), который уснет до завтра
-
         except KeyboardInterrupt:
             print("\n⏹ Остановка пользователем.")
             break
         except Exception as e:
-            print(f"💥 Error in Main Loop: {e}")
+            print(f"💥 Error: {e}")
             time.sleep(60)
 
 
